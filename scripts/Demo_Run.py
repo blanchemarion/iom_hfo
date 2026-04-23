@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Python analogue of Demo_Run.m — detector + ASLR feature extraction only (no RF).
+Python analogue of Demo_Run.m — detector + ASLR + MATLAB RF inference.
 
 Sections map to:
   - Demo_Run.m: configuration, load Dictionary, HFO_Initial_Detector_DemoVersion,
-    ASLR_Feature_extraction_kSVD (no eval_RF, no 100-event truncation).
+    ASLR_Feature_extraction_kSVD, event cap to first 100, eval_RF(model{1}).
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from iom_hfo_pipeline.aslr import aslr_feature_extraction_ksvd
 from iom_hfo_pipeline.detector import hfo_initial_detector_demo_version
+from iom_hfo_pipeline.rf_infer import eval_matlab_rf, load_matlab_rf_model
 
 
 def build_detection_param(fs_default: float = 2000.0) -> dict:
@@ -80,7 +81,7 @@ def load_dictionary(path: Path) -> list[np.ndarray]:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Demo_Run.py — detector + ASLR features (no Random Forest)."
+        description="Demo_Run.py — detector + ASLR features + MATLAB RF inference."
     )
     p.add_argument(
         "--input-mat",
@@ -95,6 +96,32 @@ def main() -> int:
         help="Dictionary_CRDL_ASLR.mat",
     )
     p.add_argument(
+        "--rf-model",
+        type=Path,
+        default=_REPO_ROOT / "Data" / "RF_CRDL_ASLR_Model.mat",
+        help="RF_CRDL_ASLR_Model.mat",
+    )
+    p.add_argument(
+        "--rf-model-index",
+        type=int,
+        default=1,
+        help="MATLAB 1-based model cell index (Demo_Run.m uses model{1}).",
+    )
+    p.add_argument(
+        "--max-events",
+        type=int,
+        default=100,
+        help=(
+            "Maximum number of events for feature+RF stage (MATLAB demo truncates to 100). "
+            "Ignored if --no-event-cap is provided."
+        ),
+    )
+    p.add_argument(
+        "--no-event-cap",
+        action="store_true",
+        help="Disable MATLAB-like event truncation and run on all detected events.",
+    )
+    p.add_argument(
         "--output-dir",
         type=Path,
         default=_REPO_ROOT / "output" / "demo_run_py",
@@ -104,6 +131,7 @@ def main() -> int:
 
     input_mat = (args.input_mat if args.input_mat.is_absolute() else _REPO_ROOT / args.input_mat).resolve()
     dict_path = (args.dictionary if args.dictionary.is_absolute() else _REPO_ROOT / args.dictionary).resolve()
+    rf_model_path = (args.rf_model if args.rf_model.is_absolute() else _REPO_ROOT / args.rf_model).resolve()
     out_dir = (args.output_dir if args.output_dir.is_absolute() else _REPO_ROOT / args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,16 +192,39 @@ def main() -> int:
         )
         return 1
 
+    # MATLAB parity: Demo_Run.m truncates result.pool.event.raw to first 100 columns
+    # before ASLR feature extraction and RF inference.
+    detected_n_events = int(event_raw.shape[1])
+    effective_max_events = None if args.no_event_cap else int(args.max_events)
+    if effective_max_events is not None and effective_max_events > 0:
+        n_used = min(detected_n_events, effective_max_events)
+    else:
+        n_used = detected_n_events
+
+    event_raw = event_raw[:, :n_used]
+    timestamp = np.asarray(pool["timestamp"]).reshape(-1)[:n_used]
+    channelinformation = np.asarray(pool["channelinformation"]).reshape(-1)[:n_used]
+    envelope_r = np.asarray(pool["info"]["envelopeSide"]["R"]).reshape(-1)[:n_used]
+    envelope_fr = np.asarray(pool["info"]["envelopeSide"]["FR"]).reshape(-1)[:n_used]
+
     features = aslr_feature_extraction_ksvd(event_raw, dict_layers, fs, denoise)
+
+    trees, rf_meta = load_matlab_rf_model(
+        rf_model_path, model_cell_index_1based=args.rf_model_index
+    )
+    pred, votes, vote_fraction = eval_matlab_rf(features, trees, class_labels=(1, 2))
+
+    pseudo_mask = pred == 1
+    real_mask = pred == 2
 
     np.savez_compressed(
         out_dir / f"{stem}_events.npz",
         event_raw=event_raw,
-        timestamp=pool["timestamp"],
-        channelinformation=pool["channelinformation"],
+        timestamp=timestamp,
+        channelinformation=channelinformation,
         fs=pool["info"]["fs"],
-        envelope_R=pool["info"]["envelopeSide"]["R"],
-        envelope_FR=pool["info"]["envelopeSide"]["FR"],
+        envelope_R=envelope_r,
+        envelope_FR=envelope_fr,
         input_mat=str(input_mat),
     )
 
@@ -201,26 +252,99 @@ def main() -> int:
         denoising_sdRemoved=denoise["sdRemoved"],
     )
 
+    # MATLAB eval_RF-style post-feature outputs.
+    np.savez_compressed(
+        out_dir / f"{stem}_predictions.npz",
+        pred=pred,
+        votes=votes,
+        vote_fraction=vote_fraction,
+        class_labels=np.array([1, 2], dtype=int),
+        pseudo_mask=pseudo_mask,
+        real_mask=real_mask,
+        pseudo_event_raw=event_raw[:, pseudo_mask],
+        real_event_raw=event_raw[:, real_mask],
+        pseudo_event_indices=np.where(pseudo_mask)[0],
+        real_event_indices=np.where(real_mask)[0],
+        rf_model_path=str(rf_model_path),
+        rf_model_index_1based=int(args.rf_model_index),
+    )
+
     # Optional .mat bundle for MATLAB (same workspace-style variables)
     savemat(
         str(out_dir / f"{stem}_pipeline_pre_rf.mat"),
         {
             "event_raw": event_raw,
             "Features": features,
-            "timestamp": pool["timestamp"],
-            "channelinformation": pool["channelinformation"],
+            "timestamp": timestamp.reshape(-1, 1),
+            "channelinformation": channelinformation.reshape(-1, 1),
             "fs": fs,
             "dictionary_path": str(dict_path),
             "input_mat": str(input_mat),
         },
     )
 
+    # Post-RF MATLAB bundle.
+    savemat(
+        str(out_dir / f"{stem}_pipeline_post_rf.mat"),
+        {
+            "event_raw": event_raw,
+            "Features": features,
+            "pred": pred.reshape(-1, 1),
+            "votes": votes,
+            "vote_fraction": vote_fraction,
+            "pseudo_event_raw": event_raw[:, pseudo_mask],
+            "real_event_raw": event_raw[:, real_mask],
+            "timestamp": timestamp.reshape(-1, 1),
+            "channelinformation": channelinformation.reshape(-1, 1),
+            "fs": fs,
+            "dictionary_path": str(dict_path),
+            "rf_model_path": str(rf_model_path),
+            "input_mat": str(input_mat),
+        },
+    )
+
+    pred_json = {
+        "input_mat": str(input_mat),
+        "rf_model": str(rf_model_path),
+        "rf_model_index_1based": int(args.rf_model_index),
+        "n_trees": int(rf_meta["n_trees"]),
+        "n_events_detected": detected_n_events,
+        "n_events_used_for_rf": int(event_raw.shape[1]),
+        "event_cap_enabled": not bool(args.no_event_cap),
+        "event_cap_max": None if args.no_event_cap else int(args.max_events),
+        "class_semantics": {
+            "1": "pseudo-HFO",
+            "2": "real-HFO",
+        },
+        "pred": pred.astype(int).tolist(),
+        "votes": votes.astype(int).tolist(),
+        "vote_fraction": vote_fraction.astype(float).tolist(),
+        "counts": {
+            "pseudo_hfo": int(np.sum(pseudo_mask)),
+            "real_hfo": int(np.sum(real_mask)),
+        },
+    }
+    (out_dir / f"{stem}_predictions.json").write_text(
+        json.dumps(pred_json, indent=2), encoding="utf-8"
+    )
+
     manifest = {
         "input_mat": str(input_mat),
         "dictionary": str(dict_path),
+        "rf_model": str(rf_model_path),
+        "n_events_detected": detected_n_events,
         "n_events": int(event_raw.shape[1]),
         "n_features": int(features.shape[1]),
         "fs_hz": fs,
+        "rf_model_info": rf_meta,
+        "event_cap": {
+            "enabled": not bool(args.no_event_cap),
+            "max_events": None if args.no_event_cap else int(args.max_events),
+        },
+        "prediction_counts": {
+            "pseudo_hfo": int(np.sum(pseudo_mask)),
+            "real_hfo": int(np.sum(real_mask)),
+        },
         "qc": {
             "max_abs_raw_assumed_uv": max_abs_uv,
         },
@@ -230,6 +354,9 @@ def main() -> int:
             "events_npz": str(out_dir / f"{stem}_events.npz"),
             "features_npz": str(out_dir / f"{stem}_features.npz"),
             "pre_rf_mat": str(out_dir / f"{stem}_pipeline_pre_rf.mat"),
+            "predictions_npz": str(out_dir / f"{stem}_predictions.npz"),
+            "predictions_json": str(out_dir / f"{stem}_predictions.json"),
+            "post_rf_mat": str(out_dir / f"{stem}_pipeline_post_rf.mat"),
         },
     }
     (out_dir / f"{stem}_manifest.json").write_text(
